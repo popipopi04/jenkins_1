@@ -1,0 +1,327 @@
+pipeline {
+    agent { label 'torpedo-rest' }  // Use the assigned node
+
+    parameters {
+        booleanParam(name: 'CLEANUP_BEFORE_DEPLOY', defaultValue: true)
+        booleanParam(name: 'DEPLOY_VMS_K8S', defaultValue: true, description: 'Deploy VMs, install k8s, and install PX')
+        booleanParam(name: 'CREATE_CONFIGMAPS_SECRETS', defaultValue: true, description: 'Create config maps for integration tests')
+        booleanParam(name: 'COPY_ARTIFACT', defaultValue: false)
+        booleanParam(name: 'RUN_TORPEDO_TEST', defaultValue: true)
+        booleanParam(name: 'CLEAN_AFTER_TEST', defaultValue: true)
+        string(name: 'NUM_NODES', defaultValue: '6', description: 'Number of nodes in the cluster')
+        string(name: 'SPAWN_IMAGE', defaultValue: 'pure-artifactory.dev.purestorage.com/px-docker-prod-virtual/portworx/spawn:master')
+        string(name: 'FOCUS_TEST', defaultValue: 'UpgradeVolumeDriverDuringAppBkpRestore')
+        string(name: 'SPEC_GENERATOR_URL', defaultValue: 'https://install.portworx.com')
+        string(name: 'SPEC_ENDPOINT', defaultValue: '3.1.4')
+        string(name: 'K8S_VERSION', defaultValue: 'v1.28.0')
+        string(name: 'VCENTER_NAME', defaultValue: 'pwx-vcsa.pwx.purestorage.com')
+        string(name: 'CLUSTER_NAME', defaultValue: 'General-System-Test')
+        string(name: 'RESOURCE_POOL_NAME', defaultValue: 'Stork-Master-RP')
+        string(name: 'DATASTORE', defaultValue: 'General-System-Test-guava-ds01')
+        string(name: 'PX_LICENSE_SERVER', defaultValue: '10.13.28.131')
+        string(name: 'OPERATOR_REPO', defaultValue: '$PX_NEXT_RELEASE_OP_REPO')
+        string(name: 'OPERATOR_TAG', defaultValue: '${PX_NEXT_RELEASE_OP_TAG}')
+        string(name: 'SPAWN_ADDITIONAL_ARGS', defaultValue: '--pxCloudUser pwx-bat --tags general')
+        string(name: 'APP_LIST', defaultValue: 'elasticsearch')
+        string(name: 'BUILD_TO_COPY', defaultValue: ' ')
+        string(name: 'STORK_IMAGE', defaultValue: 'openstorage/stork')
+        string(name: 'STORK_TAG', defaultValue: '24.3.2-dev')
+    }
+
+    triggers {
+        cron('H 0 * * 1,3,5')  // Trigger at midnight on Monday, Wednesday, Friday
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30'))  // Keep 30 builds
+        timeout(time: 600, unit: 'MINUTES')  // Set build timeout of 10 hours
+        timestamps()  // Enable timestamps in the logs
+    }
+
+    environment {
+        DockerHubUser = credentials('DockerHubUser')
+        DockerHubPassword = credentials('DockerHubPassword')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'zookeeper-app', url: 'https://github.com/portworx/torpedo'
+            }
+        }
+
+        stage('Initialize') {
+            steps {
+                sh '''
+                    if [ "${COPY_ARTIFACT}" = false ]; then
+                        mkdir -p $WORKSPACE/spawn
+                        rm -f $WORKSPACE/spawn/env_list.txt
+                        printf "
+                        BUILD_NUMBER
+                        JOB_NAME
+                        BUILD_URL
+                        WORKSPACE
+                        DASH_UID
+                        AWS_ACCESS_KEY_ID
+                        AWS_SECRET_ACCESS_KEY
+                        AWS_DEFAULT_REGION
+                        AWS_REGION
+                        AWS_ZONE
+                        AWS_INSTANCE_NAME
+                        AWS_INSTANCE_TYPE
+                        " > $WORKSPACE/spawn/env_list.txt
+                        docker system prune -a -f
+                        docker pull $SPAWN_IMAGE
+                        sudo rm -rf $WORKSPACE/spawn/instances.json
+                    fi
+                '''
+            }
+        }
+
+        stage('Cleanup VMs') {
+            when {
+                expression { return params.CLEANUP_BEFORE_DEPLOY }
+            }
+            steps {
+                sh '''
+                    docker run --rm --env-file $WORKSPACE/spawn/env_list.txt \
+                        -v $WORKSPACE:$WORKSPACE -v /var/run/docker.sock:/var/run/docker.sock $SPAWN_IMAGE \
+                        spawn --verbose --config-dir $WORKSPACE/spawn \
+                        clean vcenter --vcenter-name "${VCENTER_NAME}"
+                '''
+            }
+        }
+        stage('Conditional Steps Based on DEPLOY_VMS_K8S') {
+                    steps {
+                        script {
+                            if (env.DEPLOY_VMS_K8S == 'true') {
+                                echo 'DEPLOY_VMS_K8S is true. Running conditional steps...'
+                                
+                                // Step 1: Execute Managed Script (First)
+                                echo 'create_env_list'
+                                sh '''
+                                docker run --rm --env-file ${WORKSPACE}/env_list.txt \
+                                -v ${WORKSPACE}:${WORKSPACE} \
+                                -v /var/run/docker.sock:/var/run/docker.sock ${SPAWN_IMAGE} \
+                                spawn --verbose --config-dir ${WORKSPACE}/spawn \
+                                vms --count "${NUM_NODES}" \
+                                --cpu 16 \
+                                --memory 16384 \
+                                --disk-count-px 5 \
+                                --os "ubuntu-22.04-6.5.0-27-generic" \
+                                --provisioner vcenter \
+                                --datacenter "c7" \
+                                --networks "slc5-n5-pwx-qa-3-vlan110" \
+                                --vcenter-name "${VCENTER_NAME}" \
+                                --vcenter-cluster "${CLUSTER_NAME}" \
+                                --vcenter-datastore "${DATASTORE}" \
+                                --vcenter-resource-pool "${RESOURCE_POOL_NAME}" \
+                                --pxPrivateCloud true \
+                                --pxCloudUser pwx-bat \
+                                --tags stork-test \
+                                --test-tags team:stork,level:l3,owner:gejain,pipeline-name:storkbackuprestorewithupgrade,pipeline:true,storkPipeline:true \
+                                --branch $SPEC_ENDPOINT
+                                '''
+
+                                // Step 2: Execute Managed Script (Second)
+                                echo 'docker_spawn_provision_k8s'
+                                sh '''
+                                docker run --rm ${SPAWN_MASTER_IMAGE} \
+                                --version ${K8S_VERSION} --vm-count 6 \
+                                --env-file ${WORKSPACE}/env_list.txt
+                                '''
+                            } else {
+                                echo 'DEPLOY_VMS_K8S is false. Skipping steps.'
+                            }
+                        }
+                    }
+                }
+        
+        stage('DEPLOY_VMS_K8S') {
+            steps {
+                script {
+                    if (env.DEPLOY_VMS_K8S == 'true') {
+                        echo 'docker_spawn_provision_px-k8s'
+                        
+                        // Execute the Docker command with the provided arguments
+                        sh '''
+                        docker run --rm ${SPAWN_MASTER_IMAGE} \
+                        --install-type operator \
+                        --stork-repo ${STORK_IMAGE} \
+                        --stork-tag ${STORK_TAG} \
+                        --op-repo ${OPERATOR_REPO} \
+                        --op-tag ${OPERATOR_TAG} \
+                        --url ${SPEC_GENERATOR_URL} \
+                        --etcd-internal \
+                        --endpoint ${SPEC_ENDPOINT} \
+                        --tracefile-size 10 \
+                        --px-floating-license-server-ip ${PX_LICENSE_SERVER} \
+                        --px-monitoring=false \
+                        --px-call-home \
+                        --px-namespace kube-system \
+                        --env "PX_CH_URL=${PX_CALL_HOME_URL}" \
+                        --env-file ${WORKSPACE}/env_list.txt
+                        '''
+                    } else {
+                        echo 'DEPLOY_VMS_K8S is false, skipping script execution.'
+                    }
+                }
+            }
+        }
+
+        stage('Copy Artifact') {
+            when {
+                expression { return params.COPY_ARTIFACT }
+            }
+            steps {
+                copyArtifacts projectName: 'StorkBackupRestoreWithUpgrade', filter: 'spawn/**'
+            }
+        }
+
+        stage('Conditional ConfigMap and Secrets Creation') {
+            steps {
+                script {
+                    if (env.CREATE_CONFIGMAPS_SECRETS == 'true') {
+                        echo "CREATE_CONFIGMAPS_SECRETS is true, running conditional steps..."
+
+                        // Step 1: Run shell command for Kubernetes and Portworx setup
+                        sh '''
+                        sudo docker run -t --net=host \
+                        -v ${WORKSPACE}/spawn/k8s/clusterGroup0/kubeconfig:/tmp/kubeconfig \
+                        -e KUBECONFIG=/tmp/kubeconfig \
+                        -e SSH_USERNAME=${SSH_USERNAME} \
+                        -e SSH_PASSWORD=${SSH_PASSWORD} \
+                        lachlanevenson/k8s-kubectl -n kube-system set env deploy/stork TEST_MODE=true
+                        
+                        # Label first cluster master node
+                        MASTER_NODE=$(sudo docker run -t --net=host \
+                        -v ${WORKSPACE}/spawn/k8s/clusterGroup0/kubeconfig:/tmp/kubeconfig \
+                        -e KUBECONFIG=/tmp/kubeconfig \
+                        -e SSH_USERNAME=${SSH_USERNAME} \
+                        -e SSH_PASSWORD=${SSH_PASSWORD} \
+                        lachlanevenson/k8s-kubectl get node --selector='node-role.kubernetes.io/control-plane' -o jsonpath='{.items[0].metadata.name}')
+
+                        sudo docker run -t --net=host \
+                        -v ${WORKSPACE}/spawn/k8s/clusterGroup0/kubeconfig:/tmp/kubeconfig \
+                        -e KUBECONFIG=/tmp/kubeconfig \
+                        lachlanevenson/k8s-kubectl label nodes $MASTER_NODE px/enabled=false
+
+                        # Add DR license to Portworx
+                        PX_POD=$(docker run -t --net=host \
+                        -v ${WORKSPACE}/spawn/k8s/clusterGroup0/kubeconfig:/tmp/kubeconfig \
+                        -e KUBECONFIG=/tmp/kubeconfig \
+                        lachlanevenson/k8s-kubectl \
+                        get pods -l name=portworx -n kube-system -o jsonpath='{.items[0].metadata.name}')
+
+                        docker run -t --net=host \
+                        -v ${WORKSPACE}/spawn/k8s/clusterGroup0/kubeconfig:/tmp/kubeconfig \
+                        -e KUBECONFIG=/tmp/kubeconfig \
+                        lachlanevenson/k8s-kubectl exec $PX_POD \
+                        -n kube-system -- sh -c "/opt/pwx/bin/pxctl license setls --add DisasterRecovery,AUTCapacityManagement http://px-els.pwx.dev.purestorage.com:7070/fne/bin/capability"
+
+                        echo "Successfully added DR license on source cluster"
+                        '''
+
+                        // Step 2: Execute managed scripts for Azure, S3, GKE secrets creation
+                        echo 'Creating Azure secret...'
+                        sh '''
+                        docker run --rm azuresecret \
+                        -v ${WORKSPACE}/spawn/k8s/clusterGroup0/kubeconfig:/tmp/kubeconfig
+                        '''
+
+                        echo 'Creating S3 secret...'
+                        sh '''
+                        docker run --rm s3secret \
+                        -v ${WORKSPACE}/spawn/k8s/clusterGroup0/kubeconfig:/tmp/kubeconfig
+                        '''
+
+                        echo 'Creating GKE secret...'
+                        sh '''
+                        docker run --rm gcpsecret \
+                        -v ${WORKSPACE}/spawn/k8s/clusterGroup0/kubeconfig:/tmp/kubeconfig
+                        '''
+
+                        // Step 3: Combine secrets into config maps
+                        echo 'Combining secrets into config maps...'
+                        sh '''
+                        docker run --rm config_maps_secret_names \
+                        -v ${WORKSPACE}/spawn/k8s/clusterGroup0/kubeconfig:/tmp/kubeconfig \
+                        s3secret azuresecret gcpsecret
+                        '''
+                    } else {
+                        echo "CREATE_CONFIGMAPS_SECRETS is false, skipping config maps and secrets creation."
+                    }
+                }
+            }
+        }
+    }
+        stage('Run Torpedo Test') {
+            when {
+                expression { return env.RUN_TORPEDO_TEST.toBoolean() }
+            }
+            steps {
+                script {
+                    if (COPY_ARTIFACT == "false") {
+                        sh '''
+                            docker run -t --net=host \
+                            -v "$WORKSPACE/spawn/k8s/clusterGroup0/kubeconfig:/tmp/kubeconfig" \
+                            -v "$WORKSPACE/spawn/k8s/clusterGroup0/kubeconfig:/tmp/kubeconfig2" \
+                            -e KUBECONFIG=/tmp/kubeconfig \
+                            lachlanevenson/k8s-kubectl \
+                            create cm kubeconfigs --from-file=/tmp/kubeconfig --from-file=/tmp/kubeconfig2
+                        '''
+                    }
+
+                    def endpoints = ["https://edge-install.portworx.com/3.2.0"]
+
+                    for (endpoint in endpoints) {
+                        echo "Running Docker command with UPGRADE_STORAGE_DRIVER_ENDPOINT_LIST=${endpoint}"
+
+                        sh '''
+                            docker run --rm -t --net=host \
+                            -v "$WORKSPACE/torpedo/deployments:/deployments" \
+                            -v "$WORKSPACE/spawn/k8s/clusterGroup0/kubeconfig:/tmp/kubeconfig" \
+                            -v "$WORKSPACE/spawn/k8s/clusterGroup0/kubeconfig:/tmp/kubeconfig2" \
+                            -v $WORKSPACE/spawn/build.properties:/build.properties \
+                            -e KUBECONFIG=/tmp/kubeconfig \
+                            -e KUBECONFIGS="kubeconfig,kubeconfig2" \
+                            -e TORPEDO_IMG="pure-artifactory.dev.purestorage.com/px-docker-dev-virtual/gejain/torpedo:storkupgrade" \
+                            -e TORPEDO_SSH_PASSWORD="Password1" \
+                            -e VERBOSE="${VERBOSE}" \
+                            -e FOCUS_TESTS="${FOCUS_TEST}" \
+                            -e SCALE_FACTOR="1" \
+                            -e FAIL_FAST="true" \
+                            -e SKIP_DIAG_COLLECTION="true" \
+                            -e APP_LIST="${APP_LIST}" \
+                            -e PROVISIONER="portworx" \
+                            -e TEST_SUITE="bin/basic.test" \
+                            -e UPGRADE_STORAGE_DRIVER_ENDPOINT_LIST="${endpoint}" \
+                            --entrypoint /bin/sh \
+                            lachlanevenson/k8s-kubectl \
+                            /deployments/deploy-ssh.sh
+                        '''
+                    }
+                }
+            }
+        }
+    
+
+    post {
+        always {
+            cleanWs()
+            archiveArtifacts artifacts: 'spawn/**', allowEmptyArchive: true
+        }
+
+        failure {
+            emailext subject: "Build Failed: ${env.JOB_NAME} ${env.BUILD_NUMBER}", 
+                     body: "Build failed. Check console output at ${env.BUILD_URL}",
+                     recipientProviders: [[$class: 'ListRecipientProvider']]
+        }
+
+        success {
+            emailext subject: "Build Success: ${env.JOB_NAME} ${env.BUILD_NUMBER}", 
+                     body: "Build succeeded. Check results at ${env.BUILD_URL}",
+                     recipientProviders: [[$class: 'ListRecipientProvider']]
+        }
+    }
+}
